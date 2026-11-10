@@ -82,10 +82,15 @@ type diskCache struct {
 	used      int64
 	keys      KeyIndex
 	scanned   bool
-	stageFull bool
-	rawFull   bool
+	stageFull atomic.Bool
+	rawFull   atomic.Bool
 	checksum  string // checksum level
 	uploader  func(key, path string, force bool) bool
+
+	// admit is non-nil only for the TinyLFU admission policy. All its
+	// frequency state has its own locking and is never touched while the
+	// disk cache lock is held for disk I/O.
+	admit *tinyLFUPolicy
 
 	opTs map[time.Duration]func() error
 	opMu sync.Mutex
@@ -129,6 +134,9 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 		uploader:            uploader,
 		opTs:                make(map[time.Duration]func() error),
 		stagedBlockCooldown: config.CacheExpire / 2,
+	}
+	if tl, ok := keyIndex.(*tinylfuEviction); ok {
+		c.admit = tl.policy
 	}
 	c.stateLock = sync.Mutex{}
 	if config.Writeback {
@@ -344,17 +352,17 @@ func (cache *diskCache) isFull(usage DiskFreeRatio, stage bool) bool {
 func (cache *diskCache) checkFreeSpace() {
 	for cache.available() {
 		usage := cache.curFreeRatio()
-		cache.stageFull = cache.isFull(usage, true)
-		cache.rawFull = cache.isFull(usage, false)
-		if cache.rawFull && cache.keys.name() != EvictionNone {
+		cache.stageFull.Store(cache.isFull(usage, true))
+		cache.rawFull.Store(cache.isFull(usage, false))
+		if cache.rawFull.Load() && cache.keys.name() != EvictionNone {
 			logger.Tracef("Cleanup cache when check free space (%s): free ratio (%d%%), space usage (%d%%), inodes usage (%d%%)", cache.dir, int(cache.freeRatio*100), int(usage.br*100), int(usage.fr*100))
 			cache.Lock()
 			cache.cleanupFull()
 			cache.Unlock()
 			usage = cache.curFreeRatio()
-			cache.rawFull = cache.isFull(usage, false)
+			cache.rawFull.Store(cache.isFull(usage, false))
 		}
-		if cache.rawFull {
+		if cache.rawFull.Load() {
 			cache.uploadStaging()
 		}
 		time.Sleep(time.Second)
@@ -399,7 +407,7 @@ func (cache *diskCache) cleanupExpire() {
 			if !cache.available() {
 				break
 			}
-			_ = cache.removeFile(cache.cachePath(cache.getPathFromKey(k)))
+			cache.safeRemoveCacheFile(k)
 		}
 		todel = todel[:0]
 		time.Sleep(interval / 1000 * time.Duration((cnt+1-deleted)*1000/(cnt+1)))
@@ -436,7 +444,7 @@ func (cache *diskCache) cache(key string, p *Page, force, dropCache bool) {
 	if !cache.enabled() {
 		return
 	}
-	if cache.rawFull && cache.keys.name() == EvictionNone {
+	if cache.rawFull.Load() && cache.keys.name() == EvictionNone {
 		logger.Debugf("Caching directory is full (%s), drop %s (%d bytes)", cache.dir, key, len(p.Data))
 		cache.m.cacheDrops.Add(1)
 		return
@@ -449,6 +457,20 @@ func (cache *diskCache) cache(key string, p *Page, force, dropCache bool) {
 	k := cache.getCacheKey(key)
 	if cache.keys.get(k) != nil {
 		return
+	}
+	if cache.admit != nil {
+		// Admission only gates read blocks. Writeback staging blocks enter
+		// through stage()/uploaded() and bypass the gate unconditionally, so
+		// a rejected read block can never lose an un-uploaded copy.
+		victims, bypass := cache.admit.decide(cache, k, int32(len(p.Data)))
+		if bypass {
+			logger.Debugf("admission rejects %s (%d bytes) in %s", key, len(p.Data), cache.dir)
+			cache.m.cacheAdmissionReject.Add(1)
+			return
+		}
+		if len(victims) > 0 {
+			cache.evictAdmitted(victims)
+		}
 	}
 	p.Acquire()
 	cache.pages[key] = p
@@ -476,6 +498,77 @@ type DiskFreeRatio struct {
 	fr       float32
 	spaceCap uint64
 	inodeCap uint64
+}
+
+// evictAdmitted physically deletes victim blocks selected by the TinyLFU
+// admission policy. Index entries have already been removed and tombstones
+// recorded; file deletion happens without holding the cache lock, and every
+// victim is revalidated so a concurrently replaced generation is never
+// deleted. Caller holds the cache lock.
+func (cache *diskCache) evictAdmitted(victims []victimKey) {
+	idx := cache.keys.(*tinylfuEviction)
+	for _, v := range victims {
+		cache.used -= int64(v.size) + blockFixedOverhead
+		cache.m.cacheEvicts.Add(1)
+		logger.Debugf("admission evicts %s (%d bytes) from cache %s", v.key, v.size, cache.dir)
+	}
+	cache.Unlock()
+	for _, v := range victims {
+		if !cache.available() {
+			break
+		}
+		cache.Lock()
+		ready := cache.admit.readyForDeletion(v.key, v.full, idx, cache.pages)
+		if ready {
+			cache.Unlock()
+			path := cache.cachePath(cache.getPathFromKey(v.key))
+			if err := cache.removeFile(path); err != nil && !os.IsNotExist(err) {
+				logger.Warnf("remove %s failed: %s", path, err)
+			}
+			cache.Lock()
+		}
+		cache.admit.clearTombstone(v.key)
+		cache.Unlock()
+	}
+	cache.Lock()
+}
+
+// safeRemoveCacheFile removes an evicted cache file outside the cache lock.
+// With the TinyLFU policy the removal is revalidated against the entry
+// generation and in-flight page writes; other policies keep the direct
+// behavior. Caller must not hold the cache lock.
+func (cache *diskCache) safeRemoveCacheFile(k cacheKey) {
+	path := cache.cachePath(cache.getPathFromKey(k))
+	if cache.admit != nil {
+		idx := cache.keys.(*tinylfuEviction)
+		fullKey := cache.getPathFromKey(k)
+		cache.Lock()
+		ready := cache.admit.readyForDeletion(k, fullKey, idx, cache.pages)
+		cache.Unlock()
+		if !ready {
+			return
+		}
+		if err := cache.removeFile(path); err != nil && !os.IsNotExist(err) {
+			logger.Warnf("remove %s failed: %s", path, err)
+		}
+		cache.Lock()
+		cache.admit.clearTombstone(k)
+		cache.Unlock()
+		return
+	}
+	if err := cache.removeFile(path); err != nil && !os.IsNotExist(err) {
+		logger.Warnf("remove %s failed: %s", path, err)
+	}
+}
+
+// touch records a real logical read. Only the user read path (rSlice.ReadAt)
+// calls it; scans, index rebuilds, staging and prefetch loops never touch the
+// sketch, so they cannot inflate frequency history. It takes no cache lock and
+// performs no I/O.
+func (cache *diskCache) touch(key string) {
+	if cache.admit != nil && cache.available() {
+		cache.admit.observe(cache.getCacheKey(key))
+	}
 }
 
 // caller should not hold cache lock
@@ -654,6 +747,12 @@ func (cache *diskCache) remove(key string, staging bool) {
 			}
 		}
 	}
+	if cache.admit != nil {
+		// explicit removal owns the whole file lifecycle, drop any tombstone
+		cache.Lock()
+		cache.admit.clearTombstone(k)
+		cache.Unlock()
+	}
 }
 
 func (cache *diskCache) load(key string) (ReadCloser, error) {
@@ -682,6 +781,10 @@ func (cache *diskCache) load(key string) (ReadCloser, error) {
 	if err != nil {
 		if it := cache.keys.remove(k, false); it != nil {
 			cache.used -= int64(it.size + 4096)
+			if cache.admit != nil {
+				// the file is already missing or unreadable
+				cache.admit.clearTombstone(k)
+			}
 		}
 	}
 	return f, err
@@ -712,6 +815,10 @@ func (cache *diskCache) exist(key string) (bool, error) {
 		return true, nil
 	} else if it := cache.keys.remove(k, false); it != nil {
 		cache.used -= int64(it.size + 4096)
+		if cache.admit != nil {
+			// the file is already missing
+			cache.admit.clearTombstone(k)
+		}
 	}
 	return false, err
 }
@@ -773,7 +880,7 @@ func (cache *diskCache) add(key string, size int32, atime uint32) {
 
 func (cache *diskCache) stage(key string, data []byte, tierID uint8) (string, error) {
 	stagingPath := cache.stagePath(key)
-	if cache.stageFull {
+	if cache.stageFull.Load() {
 		return stagingPath, errStageFull
 	}
 	if cache.maxStageWrite != 0 && stagingBlocks.Load() > int64(cache.maxStageWrite) {
@@ -874,7 +981,7 @@ func (cache *diskCache) cleanupFull() {
 		if !cache.available() {
 			break
 		}
-		_ = cache.removeFile(cache.cachePath(cache.getPathFromKey(k)))
+		cache.safeRemoveCacheFile(k)
 	}
 	cache.Lock()
 }

@@ -164,7 +164,7 @@ func TestCleanupFullDoesNotBlockLoad(t *testing.T) {
 }
 
 func TestAtimeNotLost(t *testing.T) {
-	for _, eviction := range []string{EvictionNone, Eviction2Random, EvictionLRU} {
+	for _, eviction := range []string{EvictionNone, Eviction2Random, EvictionLRU, EvictionTinyLFU} {
 		cfg := defaultConf
 		cfg.CacheEviction = eviction
 		cfg.FreeSpace = 0.03

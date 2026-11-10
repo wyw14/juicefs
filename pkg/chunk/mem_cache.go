@@ -130,6 +130,10 @@ func (c *memcache) load(key string) (ReadCloser, error) {
 	return nil, errNotCached
 }
 
+// touch is a no-op for the memory cache, which keeps no frequency history and
+// always starts a fresh, empty instance when used as a fallback.
+func (c *memcache) touch(key string) {}
+
 func (c *memcache) exist(key string) (string, bool) {
 	if !c.enabled() {
 		return "", false

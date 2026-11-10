@@ -117,6 +117,10 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 
 	key := s.key(indx)
 	if s.store.conf.CacheEnabled() {
+		// Count the real logical read in the admission frequency sketch.
+		// Scans, index rebuilds, staging and the prefetch loop never call
+		// touch, and singleflight duplicate waiters share the single fetch.
+		s.store.bcache.touch(key)
 		start := time.Now()
 		r, err := s.store.bcache.load(key)
 		if err == nil {
@@ -617,12 +621,13 @@ func (c *Config) SelfCheck(uuid string) {
 	}
 	if c.CacheEviction == "" {
 		c.CacheEviction = Eviction2Random
-	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone && c.CacheEviction != EvictionLRU {
-		logger.Warnf("cache-eviction should be one of [%s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU)
+	} else if c.CacheEviction != Eviction2Random && c.CacheEviction != EvictionNone &&
+		c.CacheEviction != EvictionLRU && c.CacheEviction != EvictionTinyLFU {
+		logger.Warnf("cache-eviction should be one of [%s, %s, %s, %s]", EvictionNone, Eviction2Random, EvictionLRU, EvictionTinyLFU)
 		c.CacheEviction = Eviction2Random
 	}
-	if c.CacheDir == "memory" && c.CacheEviction == EvictionLRU {
-		logger.Warnf("LRU eviction is not supported in memory cache mode yet, setting it to 2-random")
+	if c.CacheDir == "memory" && (c.CacheEviction == EvictionLRU || c.CacheEviction == EvictionTinyLFU) {
+		logger.Warnf("%s eviction is not supported in memory cache mode yet, setting it to 2-random", c.CacheEviction)
 		c.CacheEviction = Eviction2Random
 	}
 	if c.CacheExpire > 0 && c.CacheExpire < time.Second {

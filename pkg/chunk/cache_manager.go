@@ -93,6 +93,8 @@ type CacheManager interface {
 	cache(key string, p *Page, force, dropCache bool)
 	remove(key string, staging bool)
 	load(key string) (ReadCloser, error)
+	// touch records one real logical read for admission frequency tracking.
+	touch(key string)
 	exist(key string) (string, bool)
 	uploaded(key string, size int)
 	stage(key string, data []byte, tierID uint8) (string, error)
@@ -249,6 +251,13 @@ func (m *cacheManager) cache(key string, p *Page, force, dropCache bool) {
 	store := m.getStore(key)
 	if store != nil {
 		store.cache(key, p, force, dropCache)
+	}
+}
+
+func (m *cacheManager) touch(key string) {
+	store := m.getStore(key)
+	if store != nil {
+		store.touch(key)
 	}
 }
 

@@ -22,14 +22,15 @@ import (
 
 // CacheManager Metrics
 type cacheManagerMetrics struct {
-	cacheDrops      prometheus.Counter
-	cacheWrites     prometheus.Counter
-	cacheEvicts     prometheus.Counter
-	cacheWriteBytes prometheus.Counter
-	cacheWriteHist  prometheus.Histogram
-	stageBlocks     prometheus.Gauge
-	stageBlockBytes prometheus.Gauge
-	stageWriteBytes prometheus.Counter
+	cacheDrops           prometheus.Counter
+	cacheWrites          prometheus.Counter
+	cacheEvicts          prometheus.Counter
+	cacheAdmissionReject prometheus.Counter
+	cacheWriteBytes      prometheus.Counter
+	cacheWriteHist       prometheus.Histogram
+	stageBlocks          prometheus.Gauge
+	stageBlockBytes      prometheus.Gauge
+	stageWriteBytes      prometheus.Counter
 }
 
 func newCacheManagerMetrics(reg prometheus.Registerer) *cacheManagerMetrics {
@@ -44,6 +45,7 @@ func (c *cacheManagerMetrics) registerMetrics(reg prometheus.Registerer) {
 		reg.MustRegister(c.cacheDrops)
 		reg.MustRegister(c.cacheWrites)
 		reg.MustRegister(c.cacheEvicts)
+		reg.MustRegister(c.cacheAdmissionReject)
 		reg.MustRegister(c.cacheWriteHist)
 		reg.MustRegister(c.cacheWriteBytes)
 		reg.MustRegister(c.stageBlocks)
@@ -70,6 +72,10 @@ func (c *cacheManagerMetrics) initMetrics() {
 	c.cacheEvicts = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockcache_evicts",
 		Help: "evicted cache blocks",
+	})
+	c.cacheAdmissionReject = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "blockcache_admission_rejects",
+		Help: "read blocks rejected by the cache admission policy",
 	})
 	c.cacheWriteBytes = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "blockcache_write_bytes",

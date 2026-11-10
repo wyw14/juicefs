@@ -65,6 +65,8 @@ func NewKeyIndex(config *Config) (KeyIndex, error) {
 			keys:    make(map[cacheKey]*lruItem),
 			lruHeap: atimeHeap{},
 		}, nil
+	case EvictionTinyLFU:
+		return newTinyLFUEviction(config), nil
 	default:
 		return nil, fmt.Errorf("unknown cache eviction policy: %q", config.CacheEviction)
 	}

@@ -267,7 +267,7 @@ func dataCacheFlags() []cli.Flag {
 		&cli.StringFlag{
 			Name:  "cache-eviction",
 			Value: chunk.Eviction2Random,
-			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU),
+			Usage: fmt.Sprintf("cache eviction policy [%s, %s, %s, %s]", chunk.EvictionNone, chunk.Eviction2Random, chunk.EvictionLRU, chunk.EvictionTinyLFU),
 		},
 		&cli.StringFlag{
 			Name:  "cache-scan-interval",
