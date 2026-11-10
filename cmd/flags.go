@@ -139,6 +139,24 @@ func storageFlags() []cli.Flag {
 			Value: 200,
 			Usage: "number of connections to download",
 		},
+		&cli.BoolFlag{
+			Name:  "hedge-read",
+			Usage: "issue at most one extra hedged GET when a full-block download exceeds hedge-read-threshold, to mitigate slow or faulty object storage (default: false)",
+		},
+		&cli.StringFlag{
+			Name:  "hedge-read-threshold",
+			Value: "200ms",
+			Usage: "wait time before launching the hedged GET of a slow full-block download (only effective with --hedge-read)",
+		},
+		&cli.IntFlag{
+			Name:  "max-hedge-downloads",
+			Value: 0,
+			Usage: "global concurrency budget for hedged GETs; 0 means a quarter of max-downloads (only effective with --hedge-read)",
+		},
+		&cli.StringFlag{
+			Name:  "hedge-download-limit",
+			Usage: "bandwidth limit for hedged GETs in Mbps, independent of download-limit (default: 0, unlimited)",
+		},
 		&cli.IntFlag{
 			Name:  "max-stage-write",
 			Value: 1000, // large enough for normal cases, also prevents unlimited concurrency in abnormal cases

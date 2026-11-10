@@ -242,6 +242,10 @@ juicefs config redis://localhost --min-client-version 1.0.0 --max-client-version
 |`--download-limit=0`|下载带宽限制，单位为 Mbps (默认：0)|
 |`--max-uploads=20`|上传并发上限（默认：20）|
 |`--max-downloads=200` <VersionAdd>1.4</VersionAdd>|下载并发上限（默认：200）|
+|`--hedge-read` <VersionAdd>1.5</VersionAdd>|当完整 block 的 GET 超过 `--hedge-read-threshold` 仍未完成时，最多额外发起一个对冲 GET，并采用最先通过完整读取与解压校验的结果；仅对不可变完整 block 加载生效，range 读取与本地 staging 读取不受影响（默认：false）|
+|`--hedge-read-threshold=200ms` <VersionAdd>1.5</VersionAdd>|慢 block 下载发起对冲 GET 前的等待时间（仅在启用 `--hedge-read` 时生效）|
+|`--max-hedge-downloads=0` <VersionAdd>1.5</VersionAdd>|对冲 GET 的全局并发预算，独立于 `--max-downloads`；对冲 GET 同时占用一个常规下载令牌，为 0 时取 `--max-downloads` 的四分之一（仅在启用 `--hedge-read` 时生效）|
+|`--hedge-download-limit=0` <VersionAdd>1.5</VersionAdd>|对冲 GET 的带宽限制，单位 Mbps，与 `--download-limit` 分开计量（默认：0，即不限制）|
 
 #### 管理参数 {#config-management-options}
 

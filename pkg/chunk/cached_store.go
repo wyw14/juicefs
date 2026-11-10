@@ -554,6 +554,13 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+	// HedgeRead enables one extra hedged GET for a slow full-block download.
+	// It is disabled by default and only affects immutable complete block
+	// loads; range reads, staging reads and writes never hedge.
+	HedgeRead          bool
+	HedgeReadThreshold time.Duration
+	MaxHedgeDownloads  int
+	HedgeDownloadLimit int64 // bytes per second, 0 means unlimited
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -578,6 +585,18 @@ func (c *Config) SelfCheck(uuid string) {
 	}
 	if c.DownloadLimit > 0 && int64(c.MaxDownload*c.BlockSize) > c.DownloadLimit*int64(c.GetTimeout/time.Second)/2 {
 		logger.Warnf("max-download %d may exceed bandwidth limit (bw: %d Mbps)", c.MaxDownload, (c.DownloadLimit*8)>>20)
+	}
+	if c.HedgeRead {
+		if c.HedgeReadThreshold <= 0 {
+			c.HedgeReadThreshold = defaultHedgeReadThreshold
+		}
+		if c.MaxHedgeDownloads <= 0 {
+			// Keep the hedge budget separate from, and smaller than, the
+			// regular download budget.
+			c.MaxHedgeDownloads = max((c.MaxDownload+3)/4, 1)
+		}
+		logger.Infof("hedged read enabled: threshold %s, max hedge downloads %d",
+			c.HedgeReadThreshold, c.MaxHedgeDownloads)
 	}
 	if c.BufferSize <= 32<<20 {
 		logger.Warnf("buffer-size is too small, setting it to 32 MiB")
@@ -677,6 +696,9 @@ type cachedStore struct {
 	seekable        bool
 	upLimit         *ratelimit.Bucket
 	downLimit       *ratelimit.Bucket
+	hedgeDownload   chan struct{}
+	hedgeLimit      *ratelimit.Bucket
+	hedge           *hedgeMetrics
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -766,6 +788,11 @@ func (store *cachedStore) load(ctx context.Context, key string, page *Page, cach
 			err = fmt.Errorf("recovered from %s", e)
 		}
 	}()
+	// Hedging only covers immutable complete block loads. Range reads
+	// (loadRange), staging/local cache reads and writes never reach here.
+	if store.conf.HedgeRead {
+		return store.loadHedged(ctx, key, page, cache, forceCache)
+	}
 	store.currentDownload <- struct{}{}
 	defer func() { <-store.currentDownload }()
 	needed := store.compressor.CompressBound(len(page.Data))
@@ -862,6 +889,20 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 	}
 	if config.DownloadLimit > 0 {
 		store.downLimit = ratelimit.NewBucketWithRate(float64(config.DownloadLimit)*0.85, config.DownloadLimit/10)
+	}
+	if config.HedgeRead {
+		if config.HedgeReadThreshold <= 0 {
+			config.HedgeReadThreshold = defaultHedgeReadThreshold
+		}
+		if config.MaxHedgeDownloads <= 0 {
+			config.MaxHedgeDownloads = max((config.MaxDownload+3)/4, 1)
+		}
+		store.hedgeDownload = make(chan struct{}, config.MaxHedgeDownloads)
+		if config.HedgeDownloadLimit > 0 {
+			store.hedgeLimit = ratelimit.NewBucketWithRate(float64(config.HedgeDownloadLimit)*0.85, config.HedgeDownloadLimit/10)
+		}
+		store.hedge = newHedgeMetrics()
+		store.hedge.register(reg)
 	}
 	store.initMetrics()
 	if store.conf.Writeback {
